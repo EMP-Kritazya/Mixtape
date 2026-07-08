@@ -310,32 +310,67 @@ keeping it unconditional is the smallest change that fixes the reported symptom.
 
 ### Bug #5 — The last song in a playlist never shows up
 
-- **Symptom:** Viewing a playlist's songs always shows one fewer song than the
-  playlist actually contains — specifically, the song in the last position is
-  missing. An empty playlist still shows empty (no crash), which is why it went
-  unnoticed as an off-by-one rather than a total failure.
+**Symptom:** Viewing a playlist's songs always shows one fewer song than the
+playlist actually contains — specifically, the song in the last position is
+missing. An empty playlist still shows empty (no crash), which is why it went
+unnoticed as an off-by-one rather than a total failure.
 
-- **How I reproduced it:** State needed: a playlist with N songs at positions
-  1..N. I built a 5-song playlist (`Track 1`..`Track 5`, positions 1–5) and
-  called `get_playlist_songs`:
-  - Returned **4** songs: `['Track 1', 'Track 2', 'Track 3', 'Track 4']` —
-    `Track 5` (the last position) is dropped. ❌
-  Reproduced by the failing tests
-  `tests/test_playlists.py::test_playlist_returns_all_songs` (`4 != 5`) and
-  `::test_playlist_returns_songs_in_order` ("Right contains one more item:
-  'Track 5'"). `test_empty_playlist_returns_empty_list` still passes, confirming
-  it's an off-by-one on the tail, not a broken query.
+**How I reproduced it:** State needed: a playlist with N songs at positions
+1..N. I built a 5-song playlist (`Track 1`..`Track 5`, positions 1–5) and called
+`get_playlist_songs`:
 
-- **Root cause (identified during repro, not yet fixed):** In
-  [playlist_service.py](Mixtape/services/playlist_service.py),
-  `get_playlist_songs` builds the correctly-ordered `songs` list but returns
-  `[song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice discards the last
-  element. (On an empty list, `[][:-1]` is still `[]`, which is why the empty
-  case looks fine.)
+- Returned **4** songs: `['Track 1', 'Track 2', 'Track 3', 'Track 4']` —
+  `Track 5` (the last position) is dropped. ❌
 
-- **The fix:** _(fix milestone)_
+Reproduced by the failing tests
+`tests/test_playlists.py::test_playlist_returns_all_songs` (`4 != 5`) and
+`::test_playlist_returns_songs_in_order` ("Right contains one more item:
+'Track 5'"). `test_empty_playlist_returns_empty_list` still passes, confirming
+it's an off-by-one on the tail, not a broken query.
 
-- **Verification:** _(fix milestone)_
+**How I found the root cause:** Navigation path was route → service, following
+the data flow for "view a playlist's songs." `GET /playlists/<id>/songs` in
+[routes/playlists.py](Mixtape/routes/playlists.py) calls `get_playlist_songs` in
+[playlist_service.py](Mixtape/services/playlist_service.py). I read that function
+top to bottom. The query itself is correct — it joins `playlist_entries`, filters
+by `playlist_id`, and orders by `position` ascending — so the `songs` list is
+complete and correctly ordered *before* the return. The defect is on the return
+line itself:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The moment of confidence: the docstring explicitly promises "returns all songs
+in the playlist," but the comprehension iterates `songs[:-1]`, which is every
+element *except the last*. Because the query already ordered by position, "the
+last element" is exactly the highest-position (last) song — matching the reported
+symptom precisely. That's the specific cause, not just a suspicious spot.
+
+**The root cause:** `get_playlist_songs` correctly retrieves and orders all
+playlist songs, but its return statement slices the list with `songs[:-1]`, which
+drops the final element. Since the list is ordered by `position` ascending, the
+dropped element is always the song in the last position. On an empty playlist
+`[][:-1]` evaluates to `[]`, so the empty case looked correct and masked the
+off-by-one.
+
+**Your fix and side-effect check:** Changed `songs[:-1]` to `songs` so the
+comprehension iterates the full, already-ordered list. This is the minimal
+change — the query, join, filter, and `ORDER BY position` were all correct and
+left untouched; only the erroneous slice was removed.
+
+Side-effect check — for this boundary bug I checked both ends of the list length
+range:
+
+- `pytest tests/test_playlists.py` → all 3 pass: all-songs (now 5), in-order
+  (`Track 1..5`), and empty-list.
+- Single-song playlist → returns `['Only Track']` (previously the `[:-1]` would
+  have dropped the *only* song, returning `[]`) ✅
+- Empty playlist → still returns `[]` with no error ✅
+- Ordering preserved — songs still come back in ascending `position` order ✅
+- Full suite: **13 passed** (streak, search, and playlist), so no regressions.
+
+**Commit:** `fix: stop dropping the last song from playlist song list`
 
 ---
 

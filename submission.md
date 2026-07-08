@@ -238,30 +238,73 @@ streak branches, since this is a boundary-condition bug:
 
 ### Bug #4 — Notified when a friend adds my song to a playlist, but not when they rate it
 
-- **Symptom:** When a friend adds your shared song to a playlist you receive a
-  notification, but when a friend rates your shared song you receive nothing —
-  even though both are "a friend interacted with your song" events.
+**Symptom:** When a friend adds your shared song to a playlist you receive a
+notification, but when a friend rates your shared song you receive nothing —
+even though both are "a friend interacted with your song" events.
 
-- **How I reproduced it:** State needed: a song whose `shared_by` is user A, and
-  a *different* user B who rates it. I created sharer A and friend B, shared a
-  song as A, then called `rate_song(B, song, 5)` and read A's notifications:
-  - `get_notifications(sharer)` before rating = `0`
-  - `rate_song` succeeds and stores the rating (score 5)
-  - `get_notifications(sharer)` after rating = **`0`** (expected 1). ❌
-  For contrast, the seed data ships a working `song_added_to_playlist`
-  notification, and `add_to_playlist` visibly calls `create_notification` — so
-  the playlist path notifies and the rating path does not.
+**How I reproduced it:** State needed: a song whose `shared_by` is user A, and a
+*different* user B who rates it. I created sharer A and friend B, shared a song
+as A, then called `rate_song(B, song, 5)` and read A's notifications:
 
-- **Root cause (identified during repro, not yet fixed):** In
-  [notification_service.py](Mixtape/services/notification_service.py),
-  `add_to_playlist` ends with a `create_notification(...)` call guarded by
-  `if song.shared_by != added_by_user_id`. `rate_song` saves the `Rating` and
-  commits but **never calls `create_notification` at all** — the notify step was
-  simply omitted from the rating path.
+- `get_notifications(sharer)` before rating = `0`
+- `rate_song` succeeds and stores the rating (score 5)
+- `get_notifications(sharer)` after rating = **`0`** (expected 1). ❌
 
-- **The fix:** _(fix milestone)_
+For contrast, the seed data ships a working `song_added_to_playlist`
+notification, so the playlist path notifies and the rating path does not.
 
-- **Verification:** _(fix milestone)_
+**How I found the root cause:** This bug is a *missing* action, so instead of
+hunting for wrong logic I compared the two interaction paths side by side. Both
+live in [notification_service.py](Mixtape/services/notification_service.py). I
+traced the working path first: `POST /playlists/<id>/songs` →
+`add_to_playlist`, which ends with:
+
+```python
+if song.shared_by != added_by_user_id:
+    create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", body=...)
+```
+
+Then I traced the broken path: `POST /songs/<id>/rate` in
+[routes/songs.py](Mixtape/routes/songs.py) → `rate_song` in the same service.
+Reading `rate_song` end to end, it validates the score, upserts the `Rating`,
+commits, and `return`s — there is **no `create_notification` call anywhere in
+the function**. The moment of confidence: the two functions are structurally
+parallel (both load the song, both know `song.shared_by`, both know the acting
+user) yet only one contains the notify step. The defect is the absence of that
+step in `rate_song`, not a broken condition.
+
+**The root cause:** `rate_song` persists the rating but never notifies the song's
+sharer. The notification feature was implemented for the "added to playlist"
+interaction (`add_to_playlist` calls `create_notification`) and simply never
+wired up for the "rated" interaction. Nothing was computed incorrectly — a
+required side effect was omitted entirely, so the sharer's notification list
+stays empty after a rating.
+
+**Your fix and side-effect check:** Added a `create_notification(...)` call at
+the end of `rate_song`, after the commit, mirroring the proven `add_to_playlist`
+pattern: it targets `song.shared_by`, uses type `song_rated`, and a body naming
+the rater, song, and score. I reused the same **self-interaction guard**
+(`if song.shared_by != user_id`) so rating your own song does not notify you.
+
+Side-effect checks:
+
+- Friend rates sharer's song → sharer gets exactly **1** notification, type
+  `song_rated`, body `"friend rated your song 'My Song' 5/5."` ✅
+- Sharer rates their **own** song → notification count unchanged (guard
+  suppresses self-notification) ✅
+- Invalid score (`9`) → still raises `ValueError("Score must be between 1 and
+  5")`; the notify step runs only after successful validation and commit ✅
+- Full suite: the streak and search tests still pass; the only remaining
+  failures are Bug #5's playlist tests (not yet fixed at this point), so this
+  change introduced no regressions. ✅
+
+Note on scope: I placed the notify call so it fires on every successful rate by
+a non-owner, including re-rating (the model's unique `(user_id, song_id)`
+constraint means a re-rate updates in place). Notifying the sharer when a score
+changes is consistent with the "friend interacted with your song" intent, and
+keeping it unconditional is the smallest change that fixes the reported symptom.
+
+**Commit:** `fix: notify song sharer when a friend rates their song`
 
 ---
 

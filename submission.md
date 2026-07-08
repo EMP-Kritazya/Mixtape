@@ -1,5 +1,76 @@
 # Project 5: Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used an AI assistant (Claude) as a navigation and reasoning partner throughout
+this project. The honest short version: AI was most useful for *orienting fast*
+and *explaining code I pointed it at*, and least reliable when it reasoned about
+behavior without running anything. Every diagnosis in this doc was confirmed by
+actually executing the code, not by taking the AI's word for it.
+
+**Codebase navigation (Milestone 1).** I had the AI read the service, route, and
+model files and summarize each file's responsibility and the route→service→model
+call chain. This is where it was genuinely strong — turning a dozen files into
+the "route-thin, service-fat" mental model and the two data-flow traces in the
+codebase map. I verified the map against the actual files (e.g. confirming
+`playlist_entries` really does carry a `position` column and that friendships are
+stored as two directed rows in `seed_data.py`).
+
+**Where the AI's first read was wrong or incomplete — and how I caught it.** This
+was the most valuable part of the collaboration:
+
+- **Issue #3 (search duplicates) does not actually reproduce here.** The AI's
+  initial read (and the test docstrings) said the `outerjoin(song_tags)` would
+  fan out one row per tag and duplicate multi-tag songs. That's the textbook
+  diagnosis — but when I *ran* `search_songs("Crown Heights")` against the seed
+  data it returned exactly one row, and the search tests passed. Running the code
+  contradicted the plausible-sounding explanation. Digging in, the reason is that
+  **SQLAlchemy 2.0's ORM de-duplicates full-entity query results by primary
+  key**, so the extra joined rows collapse back to one `Song` object. I asked the
+  AI to confirm that ORM behavior *after* I'd observed it, not before — and used
+  that to consciously choose the three bugs that reproduce cleanly (#1, #4, #5)
+  instead of one that's masked in this version.
+
+- **Issue #2 (feed) is similarly masked by the seed data.** The 24h
+  `RECENT_THRESHOLD` is too wide for a "listening now" feed, but the feed's
+  own "one row per friend" de-duplication hides it for the user I first queried
+  (their most recent event is minutes old, so the older ones drop out). Observing
+  this steered me away from it as a "clean" fix.
+
+- **A reproduction script crashed for an unrelated reason.** My first combined
+  repro tried to exercise `add_to_playlist`, which appends via the relationship
+  and can't populate the `NOT NULL` `position` column — an integrity error that
+  had nothing to do with the bug I was testing. I isolated Issue #4 down to just
+  `rate_song` rather than trusting the bundled script.
+
+**Debugging and tracing (Milestone 3).** For each bug I asked the AI targeted,
+post-discovery questions — e.g. "what does `datetime.weekday()` return for
+Sunday?" and "what's the structural difference between `add_to_playlist` and
+`rate_song`?" — *after* I had already located the suspicious code by tracing the
+call chain top-down. The workflow that worked: **I find the code → AI explains a
+specific mechanic → I verify by running it with controlled inputs.** I confirmed
+every root cause by executing the function directly in an in-memory SQLite app
+(isolating the exact triggering variable — weekday for #1, rater≠sharer for #4,
+list length for #5) and by running the pytest suite, rather than accepting an
+explanation at face value.
+
+**Documentation.** The AI drafted the RCA prose; I kept it honest by only letting
+it write claims that matched observed output (the notification body string, the
+exact test names and assertion messages, the boundary-check results).
+
+**Things I had to correct the AI on directly:** which virtualenv to use (it
+initially created its own and pointed at the wrong parent env), and the fact that
+`Mixtape/` is a *cloned* repo with its own `origin` fork — so commits and pushes
+had to target that repo's `bugfix/mixtape` branch, not the enclosing directory.
+
+Net: AI accelerated navigation and explanation and drafted clean documentation,
+but the diagnoses only became trustworthy once I reproduced each bug by running
+the code. The two "obvious" bugs it would have had me fix on inspection (#2, #3)
+turned out not to reproduce in this environment — a good reminder of why
+reproduce-before-fix is the discipline that mattered most.
+
+---
+
 ## Codebase Map
 
 Mixtape is a Flask + SQLAlchemy JSON API (no HTML templates — every endpoint
